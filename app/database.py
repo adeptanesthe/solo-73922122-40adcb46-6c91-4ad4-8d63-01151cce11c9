@@ -7,7 +7,12 @@
 * WAL 模式 + BEGIN IMMEDIATE 写事务，配合进程内写锁串行化所有变更，
   保证并发请求下“同条件同进度只推进一次”；
 * 已揭示前缀、条件、世代号(generation)全部落盘，重启后完整恢复；
-* 后台任务只在“仍是最新世代且条件未变”时才允许写回结果，迟到结果被丢弃。
+* 后台任务只在“仍是最新世代且条件未变”时才允许写回结果，迟到结果被丢弃；
+* 条件版本号(condition_version)单调递增、永不回退：任何条件变化（提交
+  兴趣/配额、排除/取消排除、重置演示）都使其 +1。客户端提交时带上开始
+  编辑时的版本号，写事务内原子核对，不匹配则整体拒绝——其他窗口的修改
+  不会被旧表单覆盖，过期提交也不会启动重算。不能用 generation 充当版本
+  号：重置演示会把 generation 归 1，旧表单的版本会“复活”。
 """
 from __future__ import annotations
 
@@ -38,6 +43,18 @@ _reveal_generation: int | None = None
 _reveal_batch_deadline: float = 0.0
 _reveal_batch_outcome: dict[str, Any] | None = None
 _reveal_batch_lock = threading.Lock()
+
+
+class ConditionConflict(Exception):
+    """提交基于的条件版本已过期：其他窗口已修改条件或重置了队列。
+
+    携带服务器当前条件快照，供 API 层组装 409 响应（前端据此展示新条件，
+    本窗口草稿保留在表单中不被覆盖）。
+    """
+
+    def __init__(self, current: dict[str, Any]):
+        super().__init__("条件版本冲突")
+        self.current = current
 
 
 def _now() -> str:
@@ -103,6 +120,7 @@ def init_db() -> None:
                     interest TEXT NOT NULL,
                     quotas_json TEXT NOT NULL,
                     generation INTEGER NOT NULL DEFAULT 1,
+                    condition_version INTEGER NOT NULL DEFAULT 1,
                     revealed_json TEXT NOT NULL DEFAULT '[]',
                     updated_at TEXT NOT NULL
                 );
@@ -134,6 +152,16 @@ def init_db() -> None:
                 );
                 """
             )
+            # 轻量迁移：早期版本 state 表没有 condition_version 列，
+            # 发现旧结构时补列（从 1 开始，后续变更照常递增）。
+            state_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(state)")
+            }
+            if state_cols and "condition_version" not in state_cols:
+                conn.execute(
+                    "ALTER TABLE state ADD COLUMN condition_version "
+                    "INTEGER NOT NULL DEFAULT 1"
+                )
             # 轻量迁移：早期版本 reveal_claims.expires_at 为 TEXT，
             # 与 POSIX 时间戳比较不兼容，发现旧结构时重建。
             cols = {
@@ -190,20 +218,32 @@ def init_db() -> None:
 # ---------------- 状态读取 ----------------
 
 
+def _state_from_row(row: sqlite3.Row, exclusions: set[int]) -> dict[str, Any]:
+    return {
+        "interest": row["interest"],
+        "quotas": json.loads(row["quotas_json"]),
+        "generation": row["generation"],
+        "condition_version": row["condition_version"],
+        "revealed": json.loads(row["revealed_json"]),
+        "excluded_ids": sorted(exclusions),
+        "updated_at": row["updated_at"],
+    }
+
+
+def _state_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+    """在已有连接上读取当前完整状态（写事务内核对版本失败时使用）。"""
+    row = conn.execute("SELECT * FROM state WHERE id = 1").fetchone()
+    exclusions = {r[0] for r in conn.execute("SELECT article_id FROM exclusions")}
+    return _state_from_row(row, exclusions)
+
+
 def get_state() -> dict[str, Any]:
     with _read_tx() as conn:
         row = conn.execute("SELECT * FROM state WHERE id = 1").fetchone()
         exclusions = {
             r[0] for r in conn.execute("SELECT article_id FROM exclusions")
         }
-        return {
-            "interest": row["interest"],
-            "quotas": json.loads(row["quotas_json"]),
-            "generation": row["generation"],
-            "revealed": json.loads(row["revealed_json"]),
-            "excluded_ids": sorted(exclusions),
-            "updated_at": row["updated_at"],
-        }
+        return _state_from_row(row, exclusions)
 
 
 def get_latest_job() -> dict[str, Any] | None:
@@ -256,22 +296,36 @@ def begin_new_generation(
     interest: str | None,
     quotas: dict[str, int] | None,
     compute_delay_ms: int,
+    expected_version: int | None = None,
 ) -> dict[str, Any]:
-    """修改兴趣/配额，世代号 +1，并登记一条 pending 任务。"""
+    """修改兴趣/配额，世代号 +1、条件版本 +1，并登记一条 pending 任务。
+
+    乐观并发控制：expected_version 不为 None 时，在写事务内原子核对当前
+    条件版本；不匹配说明其他窗口已修改条件或重置了队列，抛
+    ConditionConflict 并整体回滚——原条件、已揭示前缀与当前任务均不变，
+    也不会登记新的重算任务（仅成功提交才启动重算）。
+    """
     with _write_tx() as conn:
         row = conn.execute("SELECT * FROM state WHERE id = 1").fetchone()
+        if (
+            expected_version is not None
+            and row["condition_version"] != expected_version
+        ):
+            raise ConditionConflict(_state_snapshot(conn))
         cur_interest = row["interest"]
         cur_quotas = json.loads(row["quotas_json"])
         new_interest = interest if interest is not None else cur_interest
         new_quotas = quotas if quotas is not None else cur_quotas
         new_gen = row["generation"] + 1
+        new_version = row["condition_version"] + 1
         conn.execute(
             "UPDATE state SET interest = ?, quotas_json = ?, generation = ?, "
-            "updated_at = ? WHERE id = 1",
+            "condition_version = ?, updated_at = ? WHERE id = 1",
             (
                 new_interest,
                 json.dumps(new_quotas, ensure_ascii=False),
                 new_gen,
+                new_version,
                 _now(),
             ),
         )
@@ -309,8 +363,9 @@ def add_exclusion(article_id: int, compute_delay_ms: int) -> dict[str, Any]:
         new_gen = state_row["generation"] + 1
         quotas = json.loads(state_row["quotas_json"])
         conn.execute(
-            "UPDATE state SET generation = ?, updated_at = ? WHERE id = 1",
-            (new_gen, _now()),
+            "UPDATE state SET generation = ?, condition_version = ?, "
+            "updated_at = ? WHERE id = 1",
+            (new_gen, state_row["condition_version"] + 1, _now()),
         )
         _stale_running_jobs(conn)
         snapshot = {
@@ -339,8 +394,9 @@ def remove_exclusion(article_id: int, compute_delay_ms: int) -> dict[str, Any]:
         new_gen = state_row["generation"] + 1
         quotas = json.loads(state_row["quotas_json"])
         conn.execute(
-            "UPDATE state SET generation = ?, updated_at = ? WHERE id = 1",
-            (new_gen, _now()),
+            "UPDATE state SET generation = ?, condition_version = ?, "
+            "updated_at = ? WHERE id = 1",
+            (new_gen, state_row["condition_version"] + 1, _now()),
         )
         _stale_running_jobs(conn)
         snapshot = {
@@ -567,18 +623,28 @@ def reset_all(
     default_quotas: dict[str, int],
     compute_delay_ms: int = 0,
 ) -> None:
-    """清空揭示、排除与任务，状态回到世代 1 并登记首条 pending 任务。"""
+    """清空揭示、排除与任务，世代回到 1 并登记首条 pending 任务。
+
+    条件版本不归零而是继续 +1：其他窗口持有的旧版本表单在重置后提交
+    会被拒绝（世代号会回到 1，不能用它判断“重置后条件已变”）。
+    """
     _reset_reveal_batch()
     with _write_tx() as conn:
+        row = conn.execute(
+            "SELECT condition_version FROM state WHERE id = 1"
+        ).fetchone()
+        new_version = (row["condition_version"] if row else 0) + 1
         conn.execute("DELETE FROM exclusions")
         conn.execute("DELETE FROM jobs")
         conn.execute("DELETE FROM reveal_claims")
         conn.execute(
             "UPDATE state SET interest = ?, quotas_json = ?, generation = 1, "
-            "revealed_json = '[]', updated_at = ? WHERE id = 1",
+            "condition_version = ?, revealed_json = '[]', updated_at = ? "
+            "WHERE id = 1",
             (
                 default_interest,
                 json.dumps(default_quotas, ensure_ascii=False),
+                new_version,
                 _now(),
             ),
         )

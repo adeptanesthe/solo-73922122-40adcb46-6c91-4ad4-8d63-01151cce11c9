@@ -411,3 +411,245 @@ def test_restart_retains_revealed_prefix(tmp_path, monkeypatch):
             assert after["state"]["interest"] == before["state"]["interest"]
     finally:
         main.get_worker().stop()
+
+
+# ---------------- 条件版本核对：双窗口草稿保护 ----------------
+
+
+def test_stale_form_submit_rejected_and_state_untouched(client):
+    """甲保存新兴趣后，乙用旧表单整体提交：必须 409 拒绝，
+    且甲的条件、已揭示前缀、世代、版本、任务全部不变，也不登记新任务。"""
+    c, database, _ = client
+    data = _wait_done(c)
+    v0 = data["state"]["condition_version"]
+    gen0 = data["state"]["generation"]
+    old_interest = data["state"]["interest"]
+
+    # 先揭示两篇，验证拒绝时已揭示前缀不变
+    c.post("/api/reveal")
+    revealed_before = c.get("/api/status").json()["state"]["revealed"]
+    assert len(revealed_before) == 2
+
+    # 窗口甲保存新兴趣（基于最新版本）
+    r = c.put("/api/condition", json={
+        "interest": "甲的新兴趣：关注高原训练与运动营养",
+        "base_version": v0,
+    })
+    assert r.status_code == 200
+    after_a = r.json()
+    v1 = after_a["state"]["condition_version"]
+    gen1 = after_a["state"]["generation"]
+    assert v1 == v0 + 1 and gen1 == gen0 + 1
+    _wait_done(c)
+
+    # 窗口乙仍持有基于 v0 的旧表单（内含旧兴趣），只改了配额便整体提交
+    stale_quotas = {t: 1 for t in data["topics"]}
+    stale_quotas["人工智能"] = 2
+    stale_quotas["医疗健康"] = 0
+    r2 = c.put("/api/condition", json={
+        "interest": old_interest,
+        "quotas": stale_quotas,
+        "base_version": v0,
+    })
+    assert r2.status_code == 409
+    detail = r2.json()["detail"]
+    assert detail["code"] == "condition_conflict"
+    assert detail["base_version"] == v0
+    assert detail["current_version"] == v1
+    assert detail["current_interest"] == "甲的新兴趣：关注高原训练与运动营养"
+    assert detail["current_quotas"] == after_a["state"]["quotas"]
+
+    # 拒绝是原子的：甲的兴趣没有被旧表单改回，其余状态原样
+    st = c.get("/api/status").json()
+    assert st["state"]["interest"] == "甲的新兴趣：关注高原训练与运动营养"
+    assert st["state"]["condition_version"] == v1
+    assert st["state"]["generation"] == gen1
+    assert st["state"]["revealed"] == revealed_before
+    # 仅成功提交才启动重算：最新任务仍是甲的世代，没有新任务登记
+    assert database.get_latest_job()["generation"] == gen1
+    assert database.get_job(gen1)["status"] == "done"
+
+
+def test_submit_with_matching_version_succeeds_and_starts_recompute(client):
+    """携带当前版本的提交正常生效，且只有它才登记新的重算任务。"""
+    c, database, _ = client
+    data = _wait_done(c)
+    v0 = data["state"]["condition_version"]
+    gen0 = data["state"]["generation"]
+
+    r = c.put("/api/condition", json={
+        "interest": "基于最新版本提交：关注数据可视化与图表叙事",
+        "base_version": v0,
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["state"]["condition_version"] == v0 + 1
+    assert body["state"]["generation"] == gen0 + 1
+    assert body["job"]["generation"] == gen0 + 1
+    assert body["job"]["status"] in ("pending", "running", "done")
+    done = _wait_done(c)
+    assert done["state"]["interest"] == "基于最新版本提交：关注数据可视化与图表叙事"
+
+
+def test_reset_invalidates_stale_form(client):
+    """重置演示把世代归 1，但条件版本继续递增：重置前的旧表单提交仍被拒绝。"""
+    c, _, _ = client
+    data = _wait_done(c)
+    v0 = data["state"]["condition_version"]
+    gen0 = data["state"]["generation"]
+    assert gen0 == 1  # 初始世代；重置后也会回到 1，单靠世代号无法识别重置
+
+    c.post("/api/reset")
+    after_reset = _wait_done(c)
+    assert after_reset["state"]["generation"] == 1
+    assert after_reset["state"]["condition_version"] != v0
+
+    r = c.put("/api/condition", json={
+        "interest": "重置前旧表单里的兴趣",
+        "base_version": v0,
+    })
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "condition_conflict"
+    st = c.get("/api/status").json()
+    assert st["state"]["generation"] == 1  # 世代未被旧表单推进
+    assert st["state"]["interest"] == after_reset["state"]["interest"]
+
+
+def test_exclusion_change_invalidates_stale_form(client):
+    """其他窗口排除/取消排除文章同样推进条件版本，旧表单提交被拒绝。"""
+    c, _, _ = client
+    data = _wait_done(c)
+    v0 = data["state"]["condition_version"]
+    candidate = data["articles"][0]["id"]
+
+    r = c.post("/api/exclusions", json={"article_id": candidate})
+    assert r.status_code == 200
+    assert r.json()["state"]["condition_version"] == v0 + 1
+
+    r2 = c.put("/api/condition", json={
+        "interest": "基于旧版本的兴趣",
+        "base_version": v0,
+    })
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["code"] == "condition_conflict"
+
+    # 取消排除也推进版本
+    v1 = r.json()["state"]["condition_version"]
+    r3 = c.delete(f"/api/exclusions/{candidate}")
+    assert r3.status_code == 200
+    assert r3.json()["state"]["condition_version"] == v1 + 1
+
+
+def test_reveal_does_not_invalidate_form(client):
+    """揭示只推进阅读进度、不改变条件：同版本表单仍可正常提交。"""
+    c, _, _ = client
+    data = _wait_done(c)
+    v0 = data["state"]["condition_version"]
+
+    c.post("/api/reveal")
+    st = c.get("/api/status").json()
+    assert st["state"]["condition_version"] == v0
+
+    r = c.put("/api/condition", json={
+        "interest": "揭示后基于同版本提交：关注赛事数据分析",
+        "base_version": v0,
+    })
+    assert r.status_code == 200
+
+
+def test_submit_without_base_version_keeps_legacy_behavior(client):
+    """旧客户端不带 base_version：保持原有行为（不核对版本）。"""
+    c, _, _ = client
+    _wait_done(c)
+    r = c.put("/api/condition", json={"interest": "不带版本的旧客户端提交"})
+    assert r.status_code == 200
+    assert r.json()["state"]["interest"] == "不带版本的旧客户端提交"
+
+
+def test_rejected_submit_does_not_disturb_running_job(client):
+    """慢重算期间旧表单提交被拒绝：进行中的任务不受干扰，
+    其结果照常落库成为当前推荐（拒绝没有开启新世代、没有把任务标 stale）。"""
+    c, database, _ = client
+    data = _wait_done(c)
+    v0 = data["state"]["condition_version"]
+
+    # 甲开启 1.5 秒慢重算
+    r = c.put("/api/condition", json={
+        "interest": "甲的慢重算条件：关注海岛旅行与潜水装备",
+        "compute_delay_ms": 1500,
+    })
+    gen_a = r.json()["state"]["generation"]
+    v_a = r.json()["state"]["condition_version"]
+
+    # 乙用旧版本表单提交 -> 拒绝
+    r2 = c.put("/api/condition", json={
+        "interest": "乙的旧表单兴趣",
+        "base_version": v0,
+    })
+    assert r2.status_code == 409
+
+    # 甲的慢任务正常完成并落库，推荐来自甲的条件
+    import time
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        if database.get_job(gen_a)["status"] == "done":
+            break
+        time.sleep(0.05)
+    assert database.get_job(gen_a)["status"] == "done"
+    st = c.get("/api/status").json()
+    assert st["state"]["generation"] == gen_a
+    assert st["state"]["condition_version"] == v_a
+    assert st["state"]["interest"] == "甲的慢重算条件：关注海岛旅行与潜水装备"
+    assert st["plan"] is not None and st["plan"]["feasible"]
+
+
+def test_concurrent_submits_same_version_exactly_one_wins(client):
+    """两个窗口同时基于同一版本提交：写事务内原子核对保证只有一个成功。"""
+    c, database, _ = client
+    data = _wait_done(c)
+    v0 = data["state"]["condition_version"]
+
+    statuses = []
+
+    def submit(i):
+        r = c.put("/api/condition", json={
+            "interest": f"并发提交 {i}：关注主题方向 {i}",
+            "base_version": v0,
+        })
+        statuses.append(r.status_code)
+
+    threads = [threading.Thread(target=submit, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(statuses) == [200, 409, 409, 409]
+    st = c.get("/api/status").json()
+    assert st["state"]["condition_version"] == v0 + 1  # 版本只推进一次
+
+
+def test_version_check_is_atomic_at_database_layer(client):
+    """数据库层直接并发：expected_version 核对与写入在同一事务内完成。"""
+    c, database, _ = client
+    data = _wait_done(c)
+    v0 = data["state"]["condition_version"]
+
+    outcomes = []
+
+    def submit(i):
+        try:
+            database.begin_new_generation(
+                f"数据库层并发兴趣 {i}", None, 0, expected_version=v0
+            )
+            outcomes.append("ok")
+        except database.ConditionConflict:
+            outcomes.append("conflict")
+
+    threads = [threading.Thread(target=submit, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert outcomes.count("ok") == 1
+    assert outcomes.count("conflict") == 3
+    assert database.get_state()["condition_version"] == v0 + 1

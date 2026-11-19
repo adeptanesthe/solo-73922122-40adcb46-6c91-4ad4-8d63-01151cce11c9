@@ -27,6 +27,13 @@ class ConditionIn(BaseModel):
     interest: str | None = Field(default=None, description="兴趣短文")
     quotas: dict[str, int] | None = Field(default=None, description="各主题精确篇数")
     compute_delay_ms: int = Field(default=0, ge=0, le=30000)
+    base_version: int | None = Field(
+        default=None,
+        ge=1,
+        description="开始编辑时的条件版本；提供时服务器原子核对，"
+        "其他窗口已修改条件或重置队列则整体拒绝（409），"
+        "不改动任何状态也不启动重算。缺省为旧客户端兼容行为（不核对）。",
+    )
 
 
 class ExclusionIn(BaseModel):
@@ -109,10 +116,40 @@ def article_detail(article_id: int) -> dict:
     raise HTTPException(404, "文章不存在")
 
 
+def _conflict_detail(current: dict, base_version: int | None) -> dict:
+    """409 结构化的冲突详情：前端据此保留草稿并展示服务器当前条件。"""
+    return {
+        "code": "condition_conflict",
+        "message": (
+            "提交被拒绝：你编辑期间，条件已被其他窗口修改或队列已被重置。"
+            "你的草稿未生效，服务器条件保持不变；请查看最新条件后重新提交。"
+        ),
+        "base_version": base_version,
+        "current_version": current["condition_version"],
+        "current_interest": current["interest"],
+        "current_quotas": current["quotas"],
+        "generation": current["generation"],
+    }
+
+
 @app.put("/api/condition")
 def update_condition(body: ConditionIn) -> dict:
-    """修改兴趣和/或配额，开启新世代并触发异步重算。"""
+    """修改兴趣和/或配额，开启新世代并触发异步重算。
+
+    乐观并发控制：携带 base_version 的提交会先快速比对、再在写事务内
+    原子核对条件版本；版本过期（其他窗口已改条件或已重置）时返回 409，
+    原条件、已揭示前缀与当前任务均不变，也不登记新的重算任务。
+    """
     current = database.get_state()
+    # 快速路径：版本明显过期时直接拒绝，避免白做前置可行性检查；
+    # 竞态窗口由 begin_new_generation 写事务内的原子核对兜底。
+    if (
+        body.base_version is not None
+        and current["condition_version"] != body.base_version
+    ):
+        raise HTTPException(
+            409, detail=_conflict_detail(current, body.base_version)
+        )
     new_quotas = body.quotas if body.quotas is not None else current["quotas"]
     _validate_quotas(new_quotas)
     new_interest = body.interest if body.interest is not None else current["interest"]
@@ -130,11 +167,17 @@ def update_condition(body: ConditionIn) -> dict:
     if not check.feasible:
         raise HTTPException(409, f"新条件与已揭示前缀不兼容: {check.reason}")
 
-    database.begin_new_generation(
-        interest=new_interest,
-        quotas=new_quotas,
-        compute_delay_ms=body.compute_delay_ms,
-    )
+    try:
+        database.begin_new_generation(
+            interest=new_interest,
+            quotas=new_quotas,
+            compute_delay_ms=body.compute_delay_ms,
+            expected_version=body.base_version,
+        )
+    except database.ConditionConflict as exc:
+        raise HTTPException(
+            409, detail=_conflict_detail(exc.current, body.base_version)
+        ) from None
     return _status_payload()
 
 
